@@ -401,13 +401,14 @@ class IMAGDressing_v1(StableDiffusionControlNetPipeline):
 
     def get_image_embeds(self, clip_image=None, faceid_embeds=None):
         with torch.no_grad():
-            clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=torch.float16),
+            device = self._execution_device
+            clip_image_embeds = self.image_encoder(clip_image.to(device, dtype=torch.float16),
                                                    output_hidden_states=True).hidden_states[-2]
             uncond_clip_image_embeds = self.image_encoder(
-                torch.zeros_like(clip_image).to(self.device, dtype=torch.float16), output_hidden_states=True
+                torch.zeros_like(clip_image).to(device, dtype=torch.float16), output_hidden_states=True
             ).hidden_states[-2]
 
-            faceid_embeds = faceid_embeds.to(self.device, dtype=torch.float16)
+            faceid_embeds = faceid_embeds.to(device, dtype=torch.float16)
             image_prompt_embeds = self.image_proj_model(faceid_embeds, clip_image_embeds)
             uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(faceid_embeds),
                                                                uncond_clip_image_embeds)
