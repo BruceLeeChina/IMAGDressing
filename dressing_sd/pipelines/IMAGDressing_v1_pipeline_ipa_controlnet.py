@@ -12,11 +12,13 @@ from diffusers.pipelines.controlnet.pipeline_controlnet import *
 import os
 import sys
 from safetensors import safe_open
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
 
 from adapter.resampler import ProjPlusModel
-from adapter.attention_processor import RefSAttnProcessor2_0, LoraRefSAttnProcessor2_0,  IPAttnProcessor2_0, LoRAIPAttnProcessor2_0 
+from adapter.attention_processor import RefSAttnProcessor2_0, LoraRefSAttnProcessor2_0, IPAttnProcessor2_0, \
+    LoRAIPAttnProcessor2_0
 
 
 class IMAGDressing_v1(StableDiffusionControlNetPipeline):
@@ -41,11 +43,26 @@ class IMAGDressing_v1(StableDiffusionControlNetPipeline):
                 EulerAncestralDiscreteScheduler,
                 DPMSolverMultistepScheduler,
             ],
-            safety_checker: StableDiffusionSafetyChecker,
-            feature_extractor: CLIPImageProcessor,
+            safety_checker: StableDiffusionSafetyChecker = None,
+            feature_extractor: CLIPImageProcessor = None,
+            device=None,
     ):
-        super().__init__(vae, text_encoder, tokenizer, unet, controlnet, scheduler, safety_checker, feature_extractor)
+        super().__init__(
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            controlnet=controlnet,
+            scheduler=scheduler,
+            safety_checker=safety_checker,
+            feature_extractor=feature_extractor,
+            requires_safety_checker=False
+        )
 
+        # 保存 ip_ckpt 作为实例变量
+        object.__setattr__(self, 'ip_ckpt', ip_ckpt)
+
+        # 注册模块组件
         self.register_modules(
             vae=vae,
             reference_unet=reference_unet,
@@ -57,8 +74,9 @@ class IMAGDressing_v1(StableDiffusionControlNetPipeline):
             image_encoder=image_encoder,
             ImgProj=ImgProj,
             safety_checker=safety_checker,
-            feature_extractor=feature_extractor
+            feature_extractor=feature_extractor,
         )
+
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.clip_image_processor = CLIPImageProcessor()
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
@@ -70,10 +88,16 @@ class IMAGDressing_v1(StableDiffusionControlNetPipeline):
             do_convert_rgb=True,
             do_normalize=False,
         )
-        self.ip_ckpt = ip_ckpt
+
         self.num_tokens = 4
         # image proj model
         self.image_proj_model = self.init_proj()
+
+        # 移除直接设置 device 的代码，改用 to() 方法
+        if device is not None:
+            self.to(device)
+
+        # ==============================
         self.load_ip_adapter()
 
     def init_proj(self):
@@ -124,8 +148,14 @@ class IMAGDressing_v1(StableDiffusionControlNetPipeline):
 
     @property
     def _execution_device(self):
-        if self.device != torch.device("meta") or not hasattr(self.unet, "_hf_hook"):
-            return self.device
+        # 如果有明确的设备设置，使用它
+        if hasattr(self, '_device') and self._device is not None:
+            return self._device
+
+        # 否则使用父类的逻辑
+        if not hasattr(self.unet, "_hf_hook"):
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         for module in self.unet.modules():
             if (
                     hasattr(module, "_hf_hook")
@@ -133,7 +163,13 @@ class IMAGDressing_v1(StableDiffusionControlNetPipeline):
                     and module._hf_hook.execution_device is not None
             ):
                 return torch.device(module._hf_hook.execution_device)
-        return self.device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def to(self, device=None, dtype=None, silence_dtype_warnings=False):
+        # 保存设备信息到内部变量
+        if device is not None:
+            object.__setattr__(self, '_device', torch.device(device))
+        return super().to(device, dtype, silence_dtype_warnings)
 
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -373,7 +409,8 @@ class IMAGDressing_v1(StableDiffusionControlNetPipeline):
 
             faceid_embeds = faceid_embeds.to(self.device, dtype=torch.float16)
             image_prompt_embeds = self.image_proj_model(faceid_embeds, clip_image_embeds)
-            uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(faceid_embeds),uncond_clip_image_embeds)
+            uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(faceid_embeds),
+                                                               uncond_clip_image_embeds)
         return image_prompt_embeds, uncond_image_prompt_embeds
 
     def set_scale(self, scale, lora_scale):
@@ -382,12 +419,11 @@ class IMAGDressing_v1(StableDiffusionControlNetPipeline):
                 attn_processor.scale = scale
                 attn_processor.lora_scale = lora_scale
 
-
     def set_ipa_scale(self, ipa_scale, lora_scale):
         for attn_processor in self.unet.attn_processors.values():
             if isinstance(attn_processor, LoRAIPAttnProcessor2_0):
                 attn_processor.scale = ipa_scale
-                attn_processor.lora_scale = lora_scale  
+                attn_processor.lora_scale = lora_scale
             elif isinstance(attn_processor, IPAttnProcessor2_0):
                 attn_processor.scale = ipa_scale
                 attn_processor.lora_scale = lora_scale
@@ -429,7 +465,7 @@ class IMAGDressing_v1(StableDiffusionControlNetPipeline):
             control_guidance_end: Union[float, List[float]] = 1.0,
             **kwargs,
     ):
-        
+
         if face_clip_image is None:
             self.set_scale(image_scale, lora_scale=0.0)
             self.set_ipa_scale(ipa_scale=0.0, lora_scale=0.0)
@@ -740,5 +776,3 @@ class IMAGDressing_v1(StableDiffusionControlNetPipeline):
         do_denormalize = [True] * image.shape[0]
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=None)
-
-

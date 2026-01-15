@@ -1,4 +1,5 @@
 import sys
+import builtins
 from PIL import Image
 import gradio as gr
 import numpy as np
@@ -6,6 +7,9 @@ import cv2
 from modelscope.outputs import OutputKeys
 from modelscope.pipelines import pipeline
 from modelscope.utils.constant import Tasks
+
+# Make pipeline function available globally (fix for face fusion module)
+builtins.pipeline = pipeline
 from dressing_sd.pipelines.IMAGDressing_v1_pipeline_ipa_controlnet import IMAGDressing_v1
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from torchvision import transforms
@@ -56,7 +60,9 @@ image_encoder = CLIPVisionModelWithProjection.from_pretrained("h94/IP-Adapter", 
 unet = UNet2DConditionModel.from_pretrained("SG161222/Realistic_Vision_V4.0_noVAE", subfolder="unet").to(dtype=torch.float16,device=args.device)
 
 #face_model
-app = FaceAnalysis(model_path="buffalo_l", providers=[('CUDAExecutionProvider', {"device_id": args.device})])
+# Extract device ID from device string (e.g., 'cuda:0' -> '0', 'cuda' -> '0')
+device_id = args.device.split(':')[-1] if ':' in args.device else '0'
+app = FaceAnalysis(model_path="buffalo_l", providers=[('CUDAExecutionProvider', {"device_id": device_id})])
 app.prepare(ctx_id=0, det_size=(640, 640))
 
 # def ref proj weight
@@ -89,7 +95,10 @@ for name in unet.attn_processors.keys():
     if cross_attention_dim is None:
         attn_procs[name] = RefLoraSAttnProcessor2_0(name, hidden_size)
     else:
-        attn_procs[name] = LoRAIPAttnProcessor2_0(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+        attn_procs[name] = LoRAIPAttnProcessor2_0(hidden_size=hidden_size,
+                                                  cross_attention_dim=cross_attention_dim,
+                                                  scale=1.0, rank=128,
+                                                  num_tokens=4)
 
 unet.set_attn_processor(attn_procs)
 adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
@@ -169,7 +178,22 @@ def resize_img(input_image, max_side=640, min_side=512, size=None,
 
 def dress_process(garm_img, face_img, pose_img, prompt, cloth_guidance_scale, caption_guidance_scale,
                   face_guidance_scale, self_guidance_scale, cross_guidance_scale, if_ipa, if_postprocess,  if_control, denoise_steps, seed=42):
-    image_face_fusion = pipeline('face_fusion_torch', model='damo/cv_unet_face_fusion_torch',model_revision='v1.0.0')
+    # Try to initialize face fusion pipeline, but make it optional
+    image_face_fusion = None
+    
+    # Check if mmdet is available before trying to use face fusion
+    try:
+        import mmdet
+        image_face_fusion = pipeline('face_fusion_torch', model='damo/cv_unet_face_fusion_torch', model_revision='v1.0.0')
+    except ImportError:
+        print("Warning: mmdet library not found.")
+        print("Face fusion post-processing will be disabled.")
+        if_postprocess = False
+    except Exception as e:
+        print(f"Warning: Failed to initialize face fusion pipeline: {e}")
+        print("Face fusion post-processing will be disabled.")
+        if_postprocess = False
+    
     if prompt is None:
         prompt = "a photography of a model"
     prompt = prompt + ', best quality, high quality'
@@ -214,7 +238,7 @@ def dress_process(garm_img, face_img, pose_img, prompt, cloth_guidance_scale, ca
 
     pipe = IMAGDressing_v1(unet=unet, reference_unet=ref_unet, vae=vae, tokenizer=tokenizer,
                             text_encoder=text_encoder, image_encoder=image_encoder,
-                            ip_ckpt='./ckpt/ip-adapter-faceid-plus_sd15.bin',
+                            ip_ckpt='./ckpt/IP-Adapter-FaceID/ip-adapter-faceid-plus_sd15.bin',
                             ImgProj=image_proj, controlnet=control_net_openpose,
                             scheduler=noise_scheduler,
                             safety_checker=StableDiffusionSafetyChecker,
